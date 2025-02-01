@@ -2,24 +2,31 @@ package mr
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
+
+type Task struct {
+	filename  string
+	content   string
+	status    string
+	timestamp time.Time
+}
 
 type Coordinator struct {
 	// Your definitions here.
 	mu          sync.Mutex
-	mapTasks    []string          // list of map task input files
-	reduceTasks []int             // list of reduce task numbers
-	nReduce     int               // number of reduce tasks
-	nMap        int               // number of map tasks
-	phase       string            // current phase ("map" or "reduce")
-	taskStatus  map[string]string // tracks status of each task ("idle", "in-progress", "completed")
-
+	phase       string        // current phase ("map" or "reduce")
+	nMap        int           // number of map tasks
+	nReduce     int           // number of reduce tasks
+	mapTasks    map[int]*Task // list of map task input files
+	reduceTasks map[int]*Task // list of reduce task numbers
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -32,52 +39,81 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	return nil
 }
 
+func (c *Coordinator) InitWorker(args *InitWorkerArgs, reply *InitWorkerReply) error {
+	reply.NMap = c.nMap
+	reply.NReduce = c.nReduce
+	return nil
+}
+
 // GetTask handles task assignment requests from workers
-func (c *Coordinator) GetTask(args *ExampleArgs, reply *ExampleReply) error {
+func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	// Add mutex to Coordinator struct if not already present:
 	// mu sync.Mutex
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if len(c.mapTasks) == 0 {
+		c.phase = "reduce"
+	}
+
 	// Check if there are map tasks to be done
 	if len(c.mapTasks) > 0 {
 		// Assign a map task
-		for i, filename := range c.mapTasks {
-			if c.taskStatus[filename] == "idle" {
-				reply.TaskType = "map"
-				reply.Filename = filename
-				reply.TaskNum = i
-				reply.NReduce = c.nReduce
-				c.taskStatus[filename] = "in-progress"
-
-				// Remove task from mapTasks slice
-				c.mapTasks = append(c.mapTasks[:i], c.mapTasks[i+1:]...)
-				return nil
+		for i, mapTask := range c.mapTasks {
+			if mapTask.status == "idle" {
+				reply.Scheduled = true
+				reply.Phase = "map"
+				reply.TaskId = i
+				reply.Filename = mapTask.filename
+				reply.Content = mapTask.content
+				mapTask.status = "in-progress"
+				mapTask.timestamp = time.Now()
+				break
 			}
 		}
-	}
-
-	// If all map tasks are done, move to reduce tasks
-	if len(c.mapTasks) == 0 && len(c.reduceTasks) > 0 {
+	} else {
+		// If all map tasks are done, move to reduce tasks
 		// Assign a reduce task
-		for i, taskNum := range c.reduceTasks {
-			taskKey := fmt.Sprintf("reduce-%d", taskNum)
-			if c.taskStatus[taskKey] != "in-progress" {
-				reply.TaskType = "reduce"
-				reply.TaskNum = taskNum
-				reply.NMap = c.nMap
-				c.taskStatus[taskKey] = "in-progress"
-
-				// Remove task from reduceTasks slice
-				c.reduceTasks = append(c.reduceTasks[:i], c.reduceTasks[i+1:]...)
-				return nil
+		for i, reduceTask := range c.reduceTasks {
+			if reduceTask.status == "idle" {
+				reply.Scheduled = true
+				reply.Phase = "reduce"
+				reply.TaskId = i
+				reply.Filename = fmt.Sprintf("mr-*-%d", i)
+				reply.Content = ""
+				reduceTask.status = "in-progress"
+				reduceTask.timestamp = time.Now()
+				break
 			}
 		}
 	}
 
-	// No tasks available
-	reply.TaskType = "wait"
 	return nil
+}
+
+func (c *Coordinator) CommitTask(
+	args *CommitTaskArgs,
+	reply *CommitTaskReply,
+) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	phase := args.Phase
+	taskId := args.TaskId
+	if phase == "map" && c.mapTasks[taskId].status == "in-progress" {
+		delete(c.mapTasks, taskId)
+	} else if phase == "reduce" && c.reduceTasks[taskId].status == "in-progress" {
+		delete(c.reduceTasks, taskId)
+	}
+
+	reply.Done = (c.phase == "reduce" && len(c.reduceTasks) == 0)
+	return nil
+}
+
+func (c *Coordinator) Done() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.phase == "reduce" && len(c.reduceTasks) == 0
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -94,51 +130,73 @@ func (c *Coordinator) server() {
 	go http.Serve(l, nil)
 }
 
-// main/mrcoordinator.go calls Done() periodically to find out
-// if the entire job has finished.
-func (c *Coordinator) Done() bool {
-	ret := false
+func (c *Coordinator) heartbeat() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	// Your code here.
-	// check if all tasks are completed
-	if len(c.mapTasks) > 0 || len(c.reduceTasks) > 0 {
-		return false
+	for _, task := range c.mapTasks {
+		if task.status == "idle" {
+			continue
+		}
+		diff := time.Since(task.timestamp)
+		if diff.Seconds() > 10 {
+			task.status = "idle"
+		}
 	}
-	ret = true
 
-	return ret
+	for _, task := range c.reduceTasks {
+		if task.status == "idle" {
+			continue
+		}
+		diff := time.Since(task.timestamp)
+		if diff.Seconds() > 10 {
+			task.status = "idle"
+		}
+	}
 }
-
-/*func (c *Coordinator) tasksDone(args *DoneArgs, reply *DoneReply) error {
-	reply.Done = c.Done()
-	return nil
-}*/
 
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
-
-	// Your code here.
-	// initialize coordinator fields
-	c.mapTasks = make([]string, len(files))
-	c.reduceTasks = make([]int, nReduce)
-	c.nReduce = nReduce
-	c.nMap = len(files)
-	c.taskStatus = make(map[string]string)
-
-	// populate map tasks with input files
-	for i, file := range files {
-		c.mapTasks[i] = file
-		c.taskStatus[file] = "idle"
+	c := Coordinator{
+		phase:       "map",
+		nMap:        len(files),
+		nReduce:     nReduce,
+		mapTasks:    make(map[int]*Task),
+		reduceTasks: make(map[int]*Task),
 	}
 
-	// initialize reduce tasks
-	for i := 0; i < nReduce; i++ {
-		c.reduceTasks[i] = i
-		c.taskStatus[fmt.Sprintf("reduce-%d", i)] = "idle"
+	for index, filename := range files {
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("cannot open %v", filename)
+		}
+		content, err := io.ReadAll(file)
+		if err != nil {
+			log.Fatalf("cannot read %v", filename)
+		}
+		file.Close()
+
+		c.mapTasks[index] = &Task{
+			filename: filename,
+			content:  string(content),
+			status:   "idle",
+		}
 	}
+
+	for index := 0; index < nReduce; index++ {
+		c.reduceTasks[index] = &Task{
+			status: "idle",
+		}
+	}
+
+	go func() {
+		for {
+			c.heartbeat()
+			time.Sleep(time.Second)
+		}
+	}()
 
 	c.server()
 	return &c

@@ -27,12 +27,33 @@ type ExampleReply struct {
 	NMap     int
 }
 
-/*type DoneReply struct {
-	Done bool
+type InitWorkerArgs struct {
 }
 
-type DoneArgs struct {
-}*/
+type InitWorkerReply struct {
+	NMap    int
+	NReduce int
+}
+
+type GetTaskArgs struct {
+}
+
+type GetTaskReply struct {
+	Scheduled bool
+	Phase     string
+	TaskId    int
+	Filename  string
+	Content   string
+}
+
+type CommitTaskArgs struct {
+	Phase  string
+	TaskId int
+}
+
+type CommitTaskReply struct {
+	Done bool
+}
 
 // Add your RPC definitions here.
 

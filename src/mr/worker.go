@@ -1,10 +1,10 @@
 package mr
 
 import (
-	"bufio"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/rpc"
 	"os"
@@ -39,111 +39,166 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// Your worker implementation here.
 	// infinite loop to keep requesting and executing tasks
-	for {
-		// declare task request and reply structures
-		args := ExampleArgs{}
-		reply := ExampleReply{}
+	// declare task request and reply structures
+	initArgs := InitWorkerArgs{}
+	initReply := InitWorkerReply{}
 
-		// request a task from coordinator
-		ok := call("Coordinator.GetTask", &args, &reply)
-		if !ok {
-			//log.Printf("connection failed to build")
-			return
+	call("Coordinator.InitWorker", &initArgs, &initReply)
+	nMap := initReply.NMap
+	nReduce := initReply.NReduce
+
+	for {
+		getTaskArgs := GetTaskArgs{}
+		getTaskReply := GetTaskReply{}
+
+		call("Coordinator.GetTask", &getTaskArgs, &getTaskReply)
+
+		if !getTaskReply.Scheduled {
+			time.Sleep(time.Second)
+			continue
 		}
 
-		// handle different task types
-		switch reply.TaskType {
-		case "map":
-			// read input file
-			file, err := os.Open(reply.Filename)
-			if err != nil {
-				log.Fatalf("cannot open %v", reply.Filename)
-			}
-			content, err := ioutil.ReadAll(file)
-			if err != nil {
-				log.Fatalf("cannot read %v", reply.Filename)
-			}
-			file.Close()
+		taskId := getTaskReply.TaskId
+		phase := getTaskReply.Phase
+		filename := getTaskReply.Filename
+		content := getTaskReply.Content
 
-			// call Map function
-			kva := mapf(reply.Filename, string(content))
-
-			// partition map output into nReduce intermediate files
-			intermediateFiles := make([]*os.File, reply.NReduce)
-			for i := 0; i < reply.NReduce; i++ {
-				oname := fmt.Sprintf("mr-%d-%d", reply.TaskNum, i)
-				intermediateFiles[i], _ = os.Create(oname)
+		if phase == "map" {
+			mapResult := mapf(filename, content)
+			outputFileList := make([]*os.File, nReduce)
+			for i := 0; i < nReduce; i++ {
+				outputFile, err := os.CreateTemp("", fmt.Sprintf("mr-%d-%d", taskId, i))
+				if err != nil {
+					log.Fatalf("cannot create mr-%d-%d", taskId, i)
+				}
+				outputFileList[i] = outputFile
 			}
 
-			// write key-value pairs to intermediate files
-			for _, kv := range kva {
-				r := ihash(kv.Key) % reply.NReduce
-				fmt.Fprintf(intermediateFiles[r], "%v %v\n", kv.Key, kv.Value)
+			for _, kv := range mapResult {
+				reduceId := ihash(kv.Key) % nReduce
+				outputFile := outputFileList[reduceId]
+
+				enc := json.NewEncoder(outputFile)
+				encodeErr := enc.Encode(&kv)
+				if encodeErr != nil {
+					return
+				}
 			}
 
-			// close all intermediate files
-			for _, f := range intermediateFiles {
-				f.Close()
-			}
+			for reduceId := 0; reduceId < nReduce; reduceId++ {
+				resultFilename := fmt.Sprintf("mr-%d-%d", taskId, reduceId)
+				outputFile := outputFileList[reduceId]
+				if err := os.Rename(outputFile.Name(), resultFilename); err != nil {
+					inputFile, err := os.Open(outputFile.Name())
+					if err != nil {
+						log.Fatalf("cannot open temporary output file %s, %s", outputFile.Name(), err)
+					}
+					defer inputFile.Close()
 
-		case "reduce":
-			// read all intermediate files for this reduce task
-			var intermediate []KeyValue
-			for i := 0; i < reply.NMap; i++ {
-				filename := fmt.Sprintf("mr-%d-%d", i, reply.TaskNum)
+					outputFileCopy, err := os.Create(resultFilename)
+					if err != nil {
+						log.Fatalf("cannot create output file %s, %s", resultFilename, err)
+					}
+					defer outputFileCopy.Close()
+
+					// Copy the contents
+					if _, err := io.Copy(outputFileCopy, inputFile); err != nil {
+						log.Fatalf("failed to copy file from %s to %s, %s", outputFile.Name(), resultFilename, err)
+					}
+
+					// Remove the original temporary file
+					os.Remove(outputFile.Name())
+				}
+				outputFile.Close()
+			}
+		}
+
+		//log.Println("I am here 1")
+
+		if phase == "reduce" {
+			reduceInput := []KeyValue{}
+			for mapId := 0; mapId < nMap; mapId++ {
+				filename := fmt.Sprintf("mr-%d-%d", mapId, taskId)
 				file, err := os.Open(filename)
 				if err != nil {
-					continue
+					break
 				}
-				scanner := bufio.NewScanner(file)
-				for scanner.Scan() {
+				dec := json.NewDecoder(file)
+				for {
 					var kv KeyValue
-					fmt.Sscanf(scanner.Text(), "%v %v", &kv.Key, &kv.Value)
-					intermediate = append(intermediate, kv)
+					if err := dec.Decode(&kv); err != nil {
+						break
+					}
+					reduceInput = append(reduceInput, kv)
 				}
-				file.Close()
 			}
 
-			// sort intermediate data
-			sort.Sort(ByKey(intermediate))
+			sort.Sort(ByKey(reduceInput))
 
-			// create output file
-			oname := fmt.Sprintf("mr-out-%d", reply.TaskNum)
-			ofile, _ := os.Create(oname)
+			outputFileName := fmt.Sprintf(
+				"mr-out-%d",
+				taskId,
+			)
+			outputFile, _ := os.CreateTemp("", outputFileName)
+			log.Printf("output temporary file %s", outputFileName)
+			if _, err := os.Stat(outputFile.Name()); os.IsNotExist(err) {
+				log.Printf("Temporary output file %s does not exist, creating it", outputFile.Name())
+			}
 
-			// call Reduce on each distinct key
 			i := 0
-			for i < len(intermediate) {
+			for i < len(reduceInput) {
 				j := i + 1
-				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+				for j < len(reduceInput) && reduceInput[j].Key == reduceInput[i].Key {
 					j++
 				}
 				values := []string{}
 				for k := i; k < j; k++ {
-					values = append(values, intermediate[k].Value)
+					values = append(values, reduceInput[k].Value)
 				}
-				output := reducef(intermediate[i].Key, values)
-				fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+				output := reducef(reduceInput[i].Key, values)
+
+				fmt.Fprintf(outputFile, "%v %v\n", reduceInput[i].Key, output)
+
 				i = j
 			}
-			ofile.Close()
 
-		case "wait":
-			time.Sleep(time.Second)
-			continue
+			if err := os.Rename(outputFile.Name(), outputFileName); err != nil {
+				log.Printf("cannot rename the output file %s, %s", outputFileName, err)
+				inputFile, err := os.Open(outputFile.Name())
+				if err != nil {
+					log.Fatalf("cannot open temporary output file %s, %s", outputFile.Name(), err)
+				}
+				defer inputFile.Close()
 
-		case "exit":
+				outputFileCopy, err := os.Create(outputFileName)
+				if err != nil {
+					log.Fatalf("cannot create output file %s, %s", outputFileName, err)
+				}
+				defer outputFileCopy.Close()
+
+				// Copy the contents
+				if _, err := io.Copy(outputFileCopy, inputFile); err != nil {
+					log.Fatalf("failed to copy file from %s to %s, %s", outputFile.Name(), outputFileName, err)
+				}
+
+				os.Remove(outputFile.Name())
+			}
+
+			outputFile.Close()
+		}
+		//log.Printf("I am here 2")
+
+		CommitTaskArgs := CommitTaskArgs{
+			Phase:  phase,
+			TaskId: taskId,
+		}
+		CommitTaskReply := CommitTaskReply{}
+		call("Coordinator.CommitTask", &CommitTaskArgs, &CommitTaskReply)
+		if CommitTaskReply.Done {
 			return
 		}
 
-		// notify coordinator task is complete
-		// doneArgs := DoneArgs{}
-		// doneReply := DoneReply{}
-		// call("Coordinator.tasksDone", &doneArgs, &doneReply)
 	}
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
 
 }
 
