@@ -63,6 +63,15 @@ func Worker(mapf func(string, string) []KeyValue,
 		filename := getTaskReply.Filename
 		content := getTaskReply.Content
 
+		go func() {
+			updateTimestampArgs := UpdateTimestampTaskArgs{TaskId: taskId, Phase: phase}
+			updateTimestampReply := UpdateTimestampReply{}
+			for {
+				time.Sleep(1 * time.Second)
+				call("Coordinator.UpdateTaskTimestamp", &updateTimestampArgs, &updateTimestampReply)
+			}
+		}()
+
 		if phase == "map" {
 			mapResult := mapf(filename, content)
 			outputFileList := make([]*os.File, nReduce)

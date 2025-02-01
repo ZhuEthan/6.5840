@@ -55,6 +55,15 @@ type CommitTaskReply struct {
 	Done bool
 }
 
+type UpdateTimestampTaskArgs struct {
+	Phase  string
+	TaskId int
+}
+
+type UpdateTimestampReply struct {
+	Done bool
+}
+
 // Add your RPC definitions here.
 
 // Cook up a unique-ish UNIX-domain socket name

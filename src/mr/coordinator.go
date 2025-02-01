@@ -155,6 +155,36 @@ func (c *Coordinator) heartbeat() {
 	}
 }
 
+func (c *Coordinator) UpdateTaskTimestamp(
+	args *UpdateTimestampTaskArgs,
+	reply *UpdateTimestampReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	phase := args.Phase
+	log.Printf("Update task timestamp is called with %d", args.TaskId)
+
+	if phase == "map" {
+		if task, exists := c.mapTasks[args.TaskId]; exists {
+			task.timestamp = time.Now()
+			reply.Done = true
+		} else {
+			reply.Done = false
+		}
+	} else if phase == "reduce" {
+		if task, exists := c.reduceTasks[args.TaskId]; exists {
+			task.timestamp = time.Now()
+			reply.Done = true
+		} else {
+			reply.Done = false
+		}
+	} else {
+		reply.Done = false
+	}
+
+	return nil
+}
+
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
