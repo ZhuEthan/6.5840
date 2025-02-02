@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -9,10 +10,13 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
+	"sync"
 	"time"
 )
 
 type ByKey []KeyValue
+
+var taskContexts sync.Map
 
 // for sorting by key.
 func (a ByKey) Len() int           { return len(a) }
@@ -63,12 +67,24 @@ func Worker(mapf func(string, string) []KeyValue,
 		filename := getTaskReply.Filename
 		content := getTaskReply.Content
 
+		ctx, cancel := context.WithCancel(context.Background())
+		taskContexts.Store(taskId, cancel)
+		defer func() {
+			taskContexts.Delete(taskId)
+			cancel()
+		}()
+
 		go func() {
 			updateTimestampArgs := UpdateTimestampTaskArgs{TaskId: taskId, Phase: phase}
 			updateTimestampReply := UpdateTimestampReply{}
 			for {
-				time.Sleep(1 * time.Second)
-				call("Coordinator.UpdateTaskTimestamp", &updateTimestampArgs, &updateTimestampReply)
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					time.Sleep(1 * time.Second)
+					call("Coordinator.UpdateTaskTimestamp", &updateTimestampArgs, &updateTimestampReply)
+				}
 			}
 		}()
 
@@ -203,7 +219,11 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 		CommitTaskReply := CommitTaskReply{}
 		call("Coordinator.CommitTask", &CommitTaskArgs, &CommitTaskReply)
+
 		if CommitTaskReply.Done {
+			if cancelFunc, ok := taskContexts.Load(taskId); ok {
+				cancelFunc.(context.CancelFunc)() // Cancel the specific task context
+			}
 			return
 		}
 
