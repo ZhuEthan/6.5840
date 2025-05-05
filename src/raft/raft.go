@@ -305,11 +305,35 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	index := -1
 	term := -1
 	isLeader := true
 
-	// Your code here (3B).
+	if rf.state != Leader {
+		return index, term, false
+	}
+
+	//如果是领导者，就把命令追加到自己的日志中
+	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
+
+	//更新最后一条日志的索引
+	rf.lastLogIndex++
+
+	DPrintf("raft %v receive command %v, term %v", rf.me, command, rf.currentTerm)
+
+	//持久化
+	rf.persist()
+
+	rf.broadcast()
+	rf.resetHeartbeatTimer()
+
+	//返回值
+	index = rf.lastLogIndex
+	term = rf.currentTerm
+	isLeader = true
 
 	return index, term, isLeader
 }
@@ -704,45 +728,45 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
-	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
-	return ok
-}
-
-func (rf *Raft) sendHeartbeats() {
-	for !rf.killed() {
-		rf.mu.Lock()
-		if rf.state != Leader {
-			rf.mu.Unlock()
-			return
-		}
-		term := rf.currentTerm
-		rf.mu.Unlock()
-
-		for peer := range rf.peers {
-			if peer == rf.me {
-				continue
-			}
-			go func(peer int) {
-				args := AppendEntriesArgs{}
-				args.Term = term
-				args.LeaderId = rf.me
-
-				reply := AppendEntriesReply{}
-				rf.sendAppendEntries(peer, &args, &reply)
-			}(peer)
-		}
-
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
 func randomElectionTimeout() time.Duration {
 	return time.Duration(300+rand.Intn(200)) * time.Millisecond
 }
 
 func fixedHeartbeatTimeout() time.Duration {
 	return time.Millisecond * 100
+}
+
+func (rf *Raft) applier() {
+	for rf.killed() == false {
+		rf.mu.Lock()
+		for rf.lastApplied >= rf.commitIndex {
+			rf.applyCond.Wait()
+		}
+
+		lastIncludedIndex := rf.lastIncludedIndex
+		lastApplied := rf.lastApplied
+		commitIndex := rf.commitIndex
+		entries := make([]LogEntry, commitIndex-lastApplied)
+		copy(entries, rf.log[lastApplied+1-lastIncludedIndex:commitIndex+1-lastIncludedIndex])
+		rf.mu.Unlock()
+		for i, entry := range entries {
+			applymsg := ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: lastApplied + 1 + i}
+			rf.applyCh <- applymsg
+		}
+		rf.mu.Lock()
+		rf.lastApplied = Max(rf.lastApplied, commitIndex)
+		rf.mu.Unlock()
+
+		// for rf.LastApplied < rf.CommitIndex {
+		// 	rf.LastApplied++
+		// 	applymsg := ApplyMsg{CommandValid: true, Command: rf.Log[rf.LastApplied - rf.LastIncludedIndex].Command, CommandIndex: rf.LastApplied}
+		// 	DPrintf("raft %v apply log %v, term %v, index %v", rf.me, rf.Log[rf.LastApplied - rf.LastIncludedIndex].Command, rf.Log[rf.LastApplied - rf.LastIncludedIndex].Term, rf.LastApplied)
+		// 	rf.mu.Unlock()
+		// 	rf.ApplyCh <- applymsg
+		// 	rf.mu.Lock()
+		// }
+		// rf.mu.Unlock()
+	}
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -793,6 +817,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	// start applyCh goroutine to apply committed log entries
+	go rf.applier()
 
 	return rf
 }
