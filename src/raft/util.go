@@ -1,71 +1,70 @@
 package raft
 
-import (
-	"fmt"
-	"log"
-	"os"
-	"strconv"
-	"time"
-)
+import "log"
 
 // Debugging
-const Debug = false
+const Debug = true
 
-var debugStart time.Time
-var debugVerbosity int
-
-func init() {
-	debugVerbosity = getVerbosity()
-	debugStart = time.Now()
-
-	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug {
+		log.Printf(format, a...)
+	}
+	return
 }
 
-func getVerbosity() int {
-	v := os.Getenv("RAFT_VERBOSITY")
-	level := 0
-	if v != "" {
-		var err error
-		level, err = strconv.Atoi(v)
-		if err != nil {
-			log.Fatalf("Invalid verbosity %v", v)
+func (rf *Raft) GetFirstIndex() int {
+	return rf.lastIncludedIndex + 1
+}
+
+func (rf *Raft) GetLastIndex() int {
+	return len(rf.log) + rf.lastIncludedIndex
+}
+
+func (rf *Raft) CheckTermIsFirst(index int) bool {
+	if rf.lastIncludedIndex == -1 {
+		if index == -1 {
+			return true
+		}
+	} else {
+		if index == rf.lastIncludedIndex {
+			return true
 		}
 	}
-	return level
+	return false
 }
 
-// DPrintf will print debug messages if Debug is set to true
-func DPrintf(format string, a ...interface{}) {
-	if Debug {
-		time := time.Since(debugStart).Microseconds()
-		time /= 100
-		prefix := fmt.Sprintf("%06d ", time)
-		format = prefix + format
-		log.Printf(format, a...)
+func (rf *Raft) GetFirstTerm() int {
+	if rf.lastIncludedIndex == -1 {
+		return 0
 	}
+	return rf.lastIncludedTerm
 }
 
-// DPrintfLevel will print debug messages if the verbosity level is high enough
-func DPrintfLevel(level int, format string, a ...interface{}) {
-	if level <= debugVerbosity {
-		time := time.Since(debugStart).Microseconds()
-		time /= 100
-		prefix := fmt.Sprintf("%06d ", time)
-		format = prefix + format
-		log.Printf(format, a...)
+func (rf *Raft) GetLastTerm() int {
+	if rf.lastIncludedIndex == -1 {
+		return rf.log[len(rf.log)-1].Term
 	}
+
+	if len(rf.log) == 0 {
+		return rf.lastIncludedTerm
+	}
+
+	return rf.log[len(rf.log)-1].Term
 }
 
-// StateToString converts a Raft state to a string representation
-func StateToString(state int) string {
-	switch state {
-	case Follower:
-		return "Follower"
-	case Candidate:
-		return "Candidate"
-	case Leader:
-		return "Leader"
-	default:
-		return "Unknown"
+func (rf *Raft) GetAllLogLen() int {
+	if rf.lastIncludedIndex == -1 {
+		return len(rf.log)
 	}
+	return rf.lastIncludedIndex + len(rf.log) + 1
+}
+
+func (rf *Raft) CheckPreLogIndex(args *AppendEntriesArgs) bool {
+	if rf.CheckTermIsFirst(args.PrevLogIndex) {
+		return true
+	}
+	if args.PrevLogIndex >= rf.GetFirstIndex() && args.PrevLogIndex < rf.GetAllLogLen() && rf.log[args.PrevLogIndex-rf.lastIncludedIndex-1].Term == args.PrevLogTerm {
+		return true
+	}
+	return false
 }
